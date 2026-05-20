@@ -2,6 +2,8 @@
 export const TARGETS = [
   {
     text: "الرياضيات",
+    /** OCR often reads the book label without «ال» */
+    aliases: ["رياضيات"],
     url: "https://www.google.com",
     buttonLabel: "فتح Google",
   },

@@ -39,13 +39,28 @@ function normalizeArabic(text) {
     .trim();
 }
 
+function getNeedlesForTarget(target) {
+  const needles = new Set();
+  const main = normalizeArabic(target.text);
+  if (main) needles.add(main);
+  if (main.startsWith("ال") && main.length > 3) {
+    needles.add(main.slice(2));
+  }
+  for (const alias of target.aliases || []) {
+    const a = normalizeArabic(alias);
+    if (a) needles.add(a);
+  }
+  return needles;
+}
+
 function findMatchedTarget(text) {
   const normalized = normalizeArabic(text);
   if (!normalized) return null;
 
   for (const target of TARGETS) {
-    const needle = normalizeArabic(target.text);
-    if (needle && normalized.includes(needle)) return target;
+    for (const needle of getNeedlesForTarget(target)) {
+      if (normalized.includes(needle)) return target;
+    }
   }
   return null;
 }
