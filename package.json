@@ -1,13 +1,7 @@
 {
   "name": "web-ar-opencv",
-  "version": "1.0.0",
-  "description": "Camera OCR web app — opens links when Arabic text is detected",
   "private": true,
   "scripts": {
-    "start": "serve . -l 3000",
-    "dev": "serve . -l 3000"
-  },
-  "devDependencies": {
-    "serve": "^14.2.4"
+    "start": "npx --yes serve . -l 3000"
   }
 }

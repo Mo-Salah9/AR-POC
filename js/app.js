@@ -1,249 +1,169 @@
-import {
-  TARGETS,
-  SCAN_INTERVAL_MS,
-  LINK_COOLDOWN_MS,
-  MATCHES_REQUIRED,
-} from "./config.js";
-import {
-  prepareOcrFrame,
-  extractArabic,
-  collectOcrText,
-} from "./ocr-frame.js";
+/** Text patterns → URL to open when matched */
+const TRIGGERS = [
+  { pattern: /kg/i, label: "Kg", url: "https://www.google.com" },
+];
+
+const SCAN_INTERVAL_MS = 1500;
+const OPEN_COOLDOWN_MS = 8000;
+const PREVIEW_SCALE = 0.5;
 
 const video = document.getElementById("video");
-const ocrCanvas = document.getElementById("ocr-canvas");
 const overlay = document.getElementById("overlay");
 const statusEl = document.getElementById("status");
-const detectedEl = document.getElementById("detected");
-const openLinkBtn = document.getElementById("open-link");
-const loaderEl = document.getElementById("loader");
+const ocrTextEl = document.getElementById("ocrText");
+const startBtn = document.getElementById("startBtn");
+const stopBtn = document.getElementById("stopBtn");
 
+let stream = null;
 let worker = null;
+let scanning = false;
 let scanTimer = null;
-let isRunning = false;
-let isScanning = false;
-let mirrorPreview = false;
-let lastLinkOpenedAt = 0;
-let consecutiveMatches = 0;
-let lastMatchedTarget = null;
+let lastOpenedAt = 0;
 
-function setStatus(message, type = "") {
-  statusEl.textContent = message;
-  statusEl.className = `status${type ? ` ${type}` : ""}`;
+const captureCanvas = document.createElement("canvas");
+const captureCtx = captureCanvas.getContext("2d", { willReadFrequently: true });
+
+function setStatus(text, kind = "idle") {
+  statusEl.textContent = text;
+  statusEl.className = `status status--${kind}`;
 }
 
-function showLoader(visible) {
-  if (loaderEl) loaderEl.classList.toggle("hidden", !visible);
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function normalizeArabic(text) {
-  return text
-    .replace(/\s+/g, "")
-    .replace(/[\u064B-\u065F\u0670]/g, "")
-    .replace(/[أإآٱ]/g, "ا")
-    .replace(/[ىي]/g, "ي")
-    .replace(/ة/g, "ه")
-    .trim();
-}
-
-function getNeedlesForTarget(target) {
-  const needles = new Set();
-  const main = normalizeArabic(target.text);
-  if (main) needles.add(main);
-  if (main.startsWith("ال") && main.length > 3) {
-    needles.add(main.slice(2));
-  }
-  for (const alias of target.aliases || []) {
-    const a = normalizeArabic(alias);
-    if (a) needles.add(a);
-  }
-  return needles;
-}
-
-function findMatchedTarget(text) {
-  const normalized = normalizeArabic(text);
-  if (!normalized) return null;
-
-  for (const target of TARGETS) {
-    for (const needle of getNeedlesForTarget(target)) {
-      if (normalized.includes(needle)) return target;
+function findTrigger(text) {
+  for (const trigger of TRIGGERS) {
+    if (trigger.pattern.test(text)) {
+      return trigger;
     }
   }
   return null;
 }
 
-function openTargetLink(target) {
+function openLink(url, label) {
   const now = Date.now();
-  if (now - lastLinkOpenedAt < LINK_COOLDOWN_MS) return;
+  if (now - lastOpenedAt < OPEN_COOLDOWN_MS) {
+    return;
+  }
+  lastOpenedAt = now;
+  setStatus(`Found "${label}" — opening link…`, "found");
+  window.location.assign(url);
+}
 
-  lastLinkOpenedAt = now;
-  openLinkBtn.href = target.url;
-  openLinkBtn.textContent = target.buttonLabel || "فتح الرابط";
-  openLinkBtn.classList.remove("hidden");
+async function captureFrame() {
+  const w = Math.max(1, Math.floor(video.videoWidth * PREVIEW_SCALE));
+  const h = Math.max(1, Math.floor(video.videoHeight * PREVIEW_SCALE));
+  captureCanvas.width = w;
+  captureCanvas.height = h;
+  captureCtx.drawImage(video, 0, 0, w, h);
 
-  const popup = window.open(target.url, "_blank", "noopener,noreferrer");
-  if (popup) {
-    setStatus(`تم العثور على «${target.text}» — تم فتح الرابط`, "success");
-  } else {
-    setStatus(
-      `تم العثور على «${target.text}» — اضغط الزر أدناه إذا لم يُفتح الرابط`,
-      "success"
-    );
+  const overlayCtx = overlay.getContext("2d");
+  overlay.width = video.clientWidth;
+  overlay.height = video.clientHeight;
+  overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+
+  return captureCanvas;
+}
+
+async function scanOnce() {
+  if (!scanning || !worker || video.readyState < 2) {
+    return;
+  }
+
+  try {
+    const frame = await captureFrame();
+    const { data } = await worker.recognize(frame);
+    const text = (data.text || "").trim();
+
+    ocrTextEl.textContent = text || "—";
+
+    const trigger = findTrigger(text);
+    if (trigger) {
+      openLink(trigger.url, trigger.label);
+    }
+  } catch (err) {
+    console.error(err);
+    setStatus("Scan error — retrying…", "error");
   }
 }
 
-function updateDetectedDisplay(rawText) {
-  const arabic = extractArabic(rawText);
-  if (arabic) {
-    detectedEl.textContent = `النص المكتشف: ${arabic.slice(0, 100)}${arabic.length > 100 ? "…" : ""}`;
-  } else {
-    detectedEl.textContent = "ثبّت الكاميرا داخل الإطار وقرّبها من الكلمة…";
-  }
+function scheduleScan() {
+  if (!scanning) return;
+  scanTimer = window.setTimeout(async () => {
+    await scanOnce();
+    scheduleScan();
+  }, SCAN_INTERVAL_MS);
 }
 
-function isFrontCamera(track) {
-  const settings = track.getSettings?.() || {};
-  if (settings.facingMode === "user") return true;
-  if (settings.facingMode === "environment") return false;
-  const label = (track.label || "").toLowerCase();
-  return /front|user|selfie|facetime|integrated|webcam/i.test(label);
-}
+async function startCamera() {
+  setStatus("Starting camera…", "scanning");
+  startBtn.disabled = true;
 
-async function initCamera() {
-  if (!navigator.mediaDevices?.getUserMedia) {
-    throw new Error(
-      "المتصفح لا يدعم الكاميرا. افتح الموقع عبر https أو localhost."
-    );
-  }
-
-  let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       video: {
         facingMode: { ideal: "environment" },
-        width: { ideal: 1920 },
-        height: { ideal: 1080 },
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
       },
       audio: false,
     });
-  } catch {
-    stream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 1920 }, height: { ideal: 1080 } },
-      audio: false,
+
+    video.srcObject = stream;
+    await video.play();
+
+    setStatus("Loading OCR…", "scanning");
+    worker = await Tesseract.createWorker("eng");
+    await worker.setParameters({
+      tessedit_pageseg_mode: Tesseract.PSM.SINGLE_BLOCK,
     });
-  }
 
-  video.srcObject = stream;
-  await video.play();
-
-  const track = stream.getVideoTracks()[0];
-  mirrorPreview = isFrontCamera(track);
-  video.classList.toggle("mirror", mirrorPreview);
-
-  return track.label || "الكاميرا";
-}
-
-async function initOcr() {
-  setStatus("تحميل محرك التعرف على النص (العربية)…");
-  showLoader(true);
-
-  worker = await Tesseract.createWorker("ara", 1, {
-    logger: (m) => {
-      if (m.status === "loading language traineddata") {
-        setStatus("تحميل بيانات اللغة العربية…");
-      }
-      if (m.status === "initializing api") {
-        setStatus("تهيئة OCR…");
-      }
-    },
-  });
-
-  await worker.setParameters({
-    tessedit_pageseg_mode: Tesseract.PSM.AUTO,
-  });
-
-  showLoader(false);
-}
-
-async function scanOnce() {
-  if (!isRunning || isScanning || video.readyState < 2) return;
-  isScanning = true;
-
-  try {
-    const { canvas, skipped } = prepareOcrFrame(video, ocrCanvas, mirrorPreview);
-
-    if (skipped) {
-      setStatus("الصورة غير واضحة — ثبّت الكاميرا داخل الإطار");
-      detectedEl.textContent = "حركة أو ضبابية — انتظر ثانية…";
-      return;
-    }
-
-    setStatus("جاري المسح…");
-
-    const { data } = await worker.recognize(canvas, { rotateAuto: true });
-    const combined = collectOcrText(data);
-    const match = findMatchedTarget(combined);
-
-    updateDetectedDisplay(combined);
-
-    if (match) {
-      if (lastMatchedTarget?.text === match.text) {
-        consecutiveMatches += 1;
-      } else {
-        consecutiveMatches = 1;
-        lastMatchedTarget = match;
-      }
-
-      overlay.classList.add("match");
-      setStatus(`تم رصد «${match.text}» — جاري الفتح…`, "success");
-
-      if (consecutiveMatches >= MATCHES_REQUIRED) {
-        openTargetLink(match);
-      }
-    } else {
-      consecutiveMatches = 0;
-      lastMatchedTarget = null;
-      overlay.classList.remove("match");
-      openLinkBtn.classList.add("hidden");
-      setStatus("المسح جارٍ — ضع «رياضيات» داخل الإطار");
-    }
+    scanning = true;
+    stopBtn.disabled = false;
+    setStatus("Scanning for text (look for Kg)…", "scanning");
+    scheduleScan();
   } catch (err) {
     console.error(err);
-    setStatus("خطأ أثناء المسح. جاري المحاولة…", "error");
-  } finally {
-    isScanning = false;
-    if (isRunning) {
-      scanTimer = setTimeout(scanOnce, SCAN_INTERVAL_MS);
-    }
+    const msg =
+      err.name === "NotAllowedError"
+        ? "Camera permission denied"
+        : err.name === "NotFoundError"
+          ? "No camera found"
+          : "Could not start camera";
+    setStatus(msg, "error");
+    startBtn.disabled = false;
+    stopCamera();
   }
 }
 
-function startScanLoop() {
-  isRunning = true;
-  scanOnce();
-}
-
-async function main() {
-  try {
-    setStatus("طلب إذن الكاميرا…");
-    const label = await initCamera();
-    setStatus(`الكاميرا نشطة (${label}) — تحميل OCR…`);
-
-    await initOcr();
-    setStatus("المسح جارٍ — ضع «رياضيات» داخل الإطار الأخضر");
-    startScanLoop();
-  } catch (err) {
-    console.error(err);
-    showLoader(false);
-    setStatus(err.message || "تعذر تشغيل التطبيق.", "error");
+function stopCamera() {
+  scanning = false;
+  if (scanTimer) {
+    clearTimeout(scanTimer);
+    scanTimer = null;
   }
+
+  if (stream) {
+    stream.getTracks().forEach((t) => t.stop());
+    stream = null;
+  }
+
+  video.srcObject = null;
+
+  if (worker) {
+    worker.terminate();
+    worker = null;
+  }
+
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  setStatus("Stopped", "idle");
 }
+
+startBtn.addEventListener("click", startCamera);
+stopBtn.addEventListener("click", stopCamera);
 
 window.addEventListener("beforeunload", () => {
-  isRunning = false;
-  clearTimeout(scanTimer);
-  video.srcObject?.getTracks().forEach((t) => t.stop());
-  worker?.terminate();
+  stopCamera();
 });
-
-main();
