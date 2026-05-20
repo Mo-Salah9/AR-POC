@@ -102,6 +102,10 @@ document.addEventListener("DOMContentLoaded", () => {
     
     // OCR variables
     let ocrIntervalId = null;
+    let ocrWorker = null;
+    let arModelHoldUntil = 0;
+    let lastOcrTriggerKey = "";
+    let lastOcrTriggerTime = 0;
     
     // Three.js variables
     let scene, camera, renderer;
@@ -142,6 +146,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 logConsole("System configuration updated in admin dashboard. Syncing...", "warning");
                 loadConfig();
                 generateTargetsGallery();
+                updateKeywordTagsUI();
                 
                 if (isCameraStreaming) {
                     startTemplateCycling();
@@ -154,6 +159,9 @@ document.addEventListener("DOMContentLoaded", () => {
             chkOverlayAR.checked = true;
             handleOverlayARChange();
         }
+
+        // 6. Initialize OCR (immersive mode scans text without tab UI)
+        initOCR();
     }
 
     function loadConfig() {
@@ -301,14 +309,16 @@ document.addEventListener("DOMContentLoaded", () => {
             }
         });
         
-        // Keyword tags click triggers simulation
-        keywordTags.forEach(tag => {
-            tag.addEventListener("click", () => {
+        // Keyword tags (rebuilt dynamically) — use delegation
+        const keywordsPanel = document.getElementById("keywords-hud-panel");
+        if (keywordsPanel) {
+            keywordsPanel.addEventListener("click", (e) => {
+                const tag = e.target.closest(".keyword-tag");
+                if (!tag) return;
                 const word = tag.getAttribute("data-keyword");
-                logConsole(`Keyword selected manually: ${word.toUpperCase()}`);
-                triggerKeywordAction(word);
+                if (word) triggerKeywordAction(word);
             });
-        });
+        }
     }
     
     function handleTabChange(tabId) {
@@ -444,9 +454,40 @@ document.addEventListener("DOMContentLoaded", () => {
         }
 
         cameraPlaceholder.style.display = "none";
+        showImmersiveScanHud();
         startTemplateCycling();
         startOCRScanner();
         startProcessingLoop();
+    }
+
+    function showImmersiveScanHud() {
+        const ocrPanel = document.getElementById("ocr-hud-panel");
+        const keywordsPanel = document.getElementById("keywords-hud-panel");
+        if (ocrPanel) ocrPanel.style.display = "block";
+        if (keywordsPanel) keywordsPanel.style.display = "block";
+        if (hudStatusText) hudStatusText.textContent = "MULTITASK SCANNER ACTIVE";
+    }
+
+    function shouldShowARModel() {
+        return isTargetLocked || performance.now() < arModelHoldUntil;
+    }
+
+    function hideARModelIfAllowed() {
+        if (modelGroup && !shouldShowARModel()) {
+            modelGroup.visible = false;
+        }
+    }
+
+    function showTextTriggeredAR(modelName) {
+        if (!chkOverlayAR.checked || !modelGroup) return;
+
+        arModelHoldUntil = performance.now() + 8000;
+        switchModel(modelName);
+
+        const w = videoFeed.videoWidth || canvasOverlay.width || window.innerWidth;
+        const h = videoFeed.videoHeight || canvasOverlay.height || window.innerHeight;
+        modelGroup.visible = true;
+        positionModelInAR({ x: w * 0.5, y: h * 0.5 }, { x: 0.12, y: 0.12 }, 0);
     }
 
     async function startCamera() {
@@ -548,6 +589,7 @@ document.addEventListener("DOMContentLoaded", () => {
         
         if (ocrPanel) ocrPanel.style.display = "none";
         if (keywordsPanel) keywordsPanel.style.display = "none";
+        arModelHoldUntil = 0;
         if (qrPanel) qrPanel.style.display = "none";
         if (toggleDrawerBtn) toggleDrawerBtn.style.display = "none";
         if (drawer) drawer.classList.remove("open");
@@ -791,6 +833,7 @@ document.addEventListener("DOMContentLoaded", () => {
                     const linkOverlay = document.getElementById("ocr-link-overlay");
                     if (linkOverlay) linkOverlay.remove();
                 } else if (targetConfig.action === "link") {
+                    arModelHoldUntil = 0;
                     if (modelGroup) modelGroup.visible = false;
                     displayLinkOverlayCard(targetConfig.param);
                 }
@@ -808,14 +851,14 @@ document.addEventListener("DOMContentLoaded", () => {
                     isTargetLocked = false;
                     lockedTemplateId = null;
                     trackedCorners = null;
-                    if (modelGroup) modelGroup.visible = false;
+                    hideARModelIfAllowed();
                     
                     opencvStatus.className = "status-pill cv-status ready";
                     opencvStatus.innerHTML = `<i class="fa-solid fa-check-circle"></i> CV: Searching`;
                 }
             } else {
                 trackedCorners = null;
-                if (modelGroup) modelGroup.visible = false;
+                hideARModelIfAllowed();
                 
                 opencvStatus.className = "status-pill cv-status ready";
                 opencvStatus.innerHTML = `<i class="fa-solid fa-check-circle"></i> CV: Searching`;
@@ -903,11 +946,16 @@ document.addEventListener("DOMContentLoaded", () => {
     function executeTriggerAction(action, param, sourceInfo) {
         if (action === "model") {
             logConsole(`${sourceInfo} triggered model switch to ${param.toUpperCase()}`, "success");
-            switchModel(param.toLowerCase());
-            
-            // Sync buttons
+            const modelId = param.toLowerCase();
+            switchModel(modelId);
+            showTextTriggeredAR(modelId);
+
+            if (hudStatusText) {
+                hudStatusText.textContent = `KEYWORD MATCH: ${param.toUpperCase()}`;
+            }
+
             document.querySelectorAll(".model-btn").forEach(b => {
-                if (b.getAttribute("data-model") === param.toLowerCase()) b.classList.add("active");
+                if (b.getAttribute("data-model") === modelId) b.classList.add("active");
                 else b.classList.remove("active");
             });
         } else if (action === "link") {
@@ -1006,12 +1054,18 @@ document.addEventListener("DOMContentLoaded", () => {
     // OCR text reader (Tesseract.js)
     // -------------------------------------------------------------
     async function initOCR() {
-        logConsole("Loading Tesseract.js language datasetsEng...");
+        if (isOcrReady) return;
+
+        logConsole("Loading Tesseract.js language dataset (eng)...");
         ocrStatus.className = "status-pill ocr-status loading";
         ocrStatus.innerHTML = `<i class="fa-solid fa-sync fa-spin spinner-icon"></i> OCR: Loading`;
         
         try {
-            // Tesseract.js is initialized globally via CDN
+            if (typeof Tesseract.createWorker === "function") {
+                ocrWorker = await Tesseract.createWorker("eng", 1, {
+                    logger: () => {}
+                });
+            }
             isOcrReady = true;
             ocrStatus.className = "status-pill ocr-status ready";
             ocrStatus.innerHTML = `<i class="fa-solid fa-check-circle"></i> OCR: Ready`;
@@ -1021,14 +1075,23 @@ document.addEventListener("DOMContentLoaded", () => {
                 startOCRScanner();
             }
         } catch (err) {
-            logConsole("OCR Initialization failed: " + err.message, "error");
-            ocrStatus.className = "status-pill ocr-status error";
-            ocrStatus.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i> OCR: Failed`;
+            if (typeof Tesseract.recognize === "function") {
+                isOcrReady = true;
+                ocrStatus.className = "status-pill ocr-status ready";
+                ocrStatus.innerHTML = `<i class="fa-solid fa-check-circle"></i> OCR: Ready`;
+                logConsole("OCR using lightweight mode (no worker).", "warning");
+                if (isCameraStreaming) startOCRScanner();
+            } else {
+                logConsole("OCR Initialization failed: " + err.message, "error");
+                ocrStatus.className = "status-pill ocr-status error";
+                ocrStatus.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i> OCR: Failed`;
+            }
         }
     }
 
     function startOCRScanner() {
-        if (!isOcrReady || !isCameraStreaming || isFrameFrozen || isOcrScanning) return;
+        if (ocrIntervalId) return;
+        if (!isOcrReady || !isCameraStreaming || isFrameFrozen) return;
         
         logConsole("Starting Text Scanner parser background threads.");
         ocrLiveText.textContent = "Scanning camera frames... Keep camera steady.";
@@ -1068,8 +1131,10 @@ document.addEventListener("DOMContentLoaded", () => {
                     0, 0, tempCanvas.width, tempCanvas.height // dst
                 );
                 
-                // Run OCR
-                const { data: { text, confidence } } = await Tesseract.recognize(tempCanvas, 'eng');
+                const result = ocrWorker
+                    ? await ocrWorker.recognize(tempCanvas)
+                    : await Tesseract.recognize(tempCanvas, "eng");
+                const { text, confidence } = result.data;
                 
                 const elapsed = (performance.now() - ocrStartTime).toFixed(0);
                 ocrSpeed.textContent = `Latency: ${elapsed} ms`;
@@ -1165,15 +1230,22 @@ document.addEventListener("DOMContentLoaded", () => {
             if (isMatch) {
                 matchedAny = true;
                 
-                // Highlight tag in UI
-                const tag = document.querySelector(`.keyword-tag[data-keyword="${t.keyword}"]`);
+                const tag = document.querySelector(`.keyword-tag[data-keyword="${CSS.escape(t.keyword)}"]`)
+                    || document.querySelector(`.keyword-tag[data-keyword="${t.keyword}"]`);
                 if (tag) {
                     tag.classList.add("matched");
                     setTimeout(() => tag.classList.remove("matched"), 2500);
                 }
-                
-                // Execute action
-                executeTriggerAction(t.action, t.param, `OCR Keyword: '${t.keyword.toUpperCase()}'`);
+
+                const triggerKey = `${t.keyword}|${t.action}|${t.param}`;
+                const now = performance.now();
+                if (triggerKey !== lastOcrTriggerKey || now - lastOcrTriggerTime > 3000) {
+                    lastOcrTriggerKey = triggerKey;
+                    lastOcrTriggerTime = now;
+                    executeTriggerAction(t.action, t.param, `OCR Keyword: '${t.keyword.toUpperCase()}'`);
+                } else if (t.action === "model" && chkOverlayAR.checked) {
+                    arModelHoldUntil = now + 8000;
+                }
             }
         });
         
@@ -1189,20 +1261,21 @@ document.addEventListener("DOMContentLoaded", () => {
     }
     
     function triggerKeywordAction(keyword) {
-        const tag = document.querySelector(`.keyword-tag[data-keyword="${keyword}"]`);
+        logConsole(`Keyword selected: ${keyword.toUpperCase()}`);
+
+        const tag = document.querySelector(`.keyword-tag[data-keyword="${CSS.escape(keyword)}"]`)
+            || document.querySelector(`.keyword-tag[data-keyword="${keyword}"]`);
         if (tag) {
             tag.classList.add("matched");
             setTimeout(() => tag.classList.remove("matched"), 2500);
         }
         
-        // Find action for the keyword in config
         const trigger = config.textTriggers.find(t => t.keyword.toLowerCase().trim() === keyword.toLowerCase().trim());
         if (trigger) {
-            executeTriggerAction(trigger.action, trigger.param, `Interactive Click: '${keyword.toUpperCase()}'`);
+            executeTriggerAction(trigger.action, trigger.param, `Manual Keyword: '${keyword.toUpperCase()}'`);
         } else {
-            // Fallback default model load
             logConsole(`Loading model ${keyword.toUpperCase()}...`, "success");
-            switchModel(keyword);
+            showTextTriggeredAR(keyword.toLowerCase());
         }
     }
     

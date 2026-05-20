@@ -1711,7 +1711,9 @@ body {
     max-width: 100%;
     overflow: hidden;
     text-overflow: ellipsis;
-    white-space: nowrap;
+    white-space: normal;
+    line-height: 1.35;
+    max-height: 3.2em;
     font-family: var(--font-mono);
 }
 
