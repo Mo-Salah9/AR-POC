@@ -9,7 +9,6 @@ export const TARGETS = [
   },
 ];
 
-export const SCAN_INTERVAL_MS = 1200;
+export const SCAN_INTERVAL_MS = 600;
 export const LINK_COOLDOWN_MS = 8000;
-/** Require this many scans in a row before opening link (reduces false positives) */
-export const MATCHES_REQUIRED = 2;
+export const MATCHES_REQUIRED = 1;

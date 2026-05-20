@@ -4,9 +4,14 @@ import {
   LINK_COOLDOWN_MS,
   MATCHES_REQUIRED,
 } from "./config.js";
+import {
+  prepareOcrFrame,
+  extractArabic,
+  collectOcrText,
+} from "./ocr-frame.js";
 
 const video = document.getElementById("video");
-const canvas = document.getElementById("canvas");
+const ocrCanvas = document.getElementById("ocr-canvas");
 const overlay = document.getElementById("overlay");
 const statusEl = document.getElementById("status");
 const detectedEl = document.getElementById("detected");
@@ -15,7 +20,9 @@ const loaderEl = document.getElementById("loader");
 
 let worker = null;
 let scanTimer = null;
+let isRunning = false;
 let isScanning = false;
+let mirrorPreview = false;
 let lastLinkOpenedAt = 0;
 let consecutiveMatches = 0;
 let lastMatchedTarget = null;
@@ -85,10 +92,27 @@ function openTargetLink(target) {
   }
 }
 
+function updateDetectedDisplay(rawText) {
+  const arabic = extractArabic(rawText);
+  if (arabic) {
+    detectedEl.textContent = `النص المكتشف: ${arabic.slice(0, 100)}${arabic.length > 100 ? "…" : ""}`;
+  } else {
+    detectedEl.textContent = "ثبّت الكاميرا داخل الإطار وقرّبها من الكلمة…";
+  }
+}
+
+function isFrontCamera(track) {
+  const settings = track.getSettings?.() || {};
+  if (settings.facingMode === "user") return true;
+  if (settings.facingMode === "environment") return false;
+  const label = (track.label || "").toLowerCase();
+  return /front|user|selfie|facetime|integrated|webcam/i.test(label);
+}
+
 async function initCamera() {
   if (!navigator.mediaDevices?.getUserMedia) {
     throw new Error(
-      "المتصفح لا يدعم الكاميرا. افتح الموقع عبر http://localhost وليس ملفًا محليًا."
+      "المتصفح لا يدعم الكاميرا. افتح الموقع عبر https أو localhost."
     );
   }
 
@@ -97,14 +121,14 @@ async function initCamera() {
     stream = await navigator.mediaDevices.getUserMedia({
       video: {
         facingMode: { ideal: "environment" },
-        width: { ideal: 1280 },
-        height: { ideal: 720 },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 },
       },
       audio: false,
     });
   } catch {
     stream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+      video: { width: { ideal: 1920 }, height: { ideal: 1080 } },
       audio: false,
     });
   }
@@ -113,8 +137,8 @@ async function initCamera() {
   await video.play();
 
   const track = stream.getVideoTracks()[0];
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
+  mirrorPreview = isFrontCamera(track);
+  video.classList.toggle("mirror", mirrorPreview);
 
   return track.label || "الكاميرا";
 }
@@ -131,56 +155,36 @@ async function initOcr() {
       if (m.status === "initializing api") {
         setStatus("تهيئة OCR…");
       }
-      if (m.status === "recognizing text") {
-        setStatus(`جاري المسح… ${Math.round((m.progress || 0) * 100)}%`);
-      }
     },
   });
 
   await worker.setParameters({
-    tessedit_pageseg_mode: Tesseract.PSM.SINGLE_BLOCK,
+    tessedit_pageseg_mode: Tesseract.PSM.AUTO,
   });
 
   showLoader(false);
 }
 
-/** Grayscale + contrast for clearer Arabic OCR */
-function captureProcessedFrame() {
-  const w = canvas.width;
-  const h = canvas.height;
-  const ctx = canvas.getContext("2d", { willReadFrequently: true });
-
-  ctx.drawImage(video, 0, 0, w, h);
-  const imageData = ctx.getImageData(0, 0, w, h);
-  const d = imageData.data;
-  const contrast = 1.4;
-  const intercept = 128 * (1 - contrast);
-
-  for (let i = 0; i < d.length; i += 4) {
-    const gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-    const boosted = Math.min(255, Math.max(0, gray * contrast + intercept));
-    d[i] = d[i + 1] = d[i + 2] = boosted;
-  }
-
-  ctx.putImageData(imageData, 0, 0);
-  return canvas;
-}
-
 async function scanOnce() {
-  if (isScanning || video.readyState < 2) return;
+  if (!isRunning || isScanning || video.readyState < 2) return;
   isScanning = true;
 
   try {
-    const frame = captureProcessedFrame();
-    const { data } = await worker.recognize(frame);
-    const text = (data.text || "").trim();
-    const match = findMatchedTarget(text);
+    const { canvas, skipped } = prepareOcrFrame(video, ocrCanvas, mirrorPreview);
 
-    if (text) {
-      detectedEl.textContent = `النص المكتشف: ${text.slice(0, 120)}${text.length > 120 ? "…" : ""}`;
-    } else {
-      detectedEl.textContent = "";
+    if (skipped) {
+      setStatus("الصورة غير واضحة — ثبّت الكاميرا داخل الإطار");
+      detectedEl.textContent = "حركة أو ضبابية — انتظر ثانية…";
+      return;
     }
+
+    setStatus("جاري المسح…");
+
+    const { data } = await worker.recognize(canvas, { rotateAuto: true });
+    const combined = collectOcrText(data);
+    const match = findMatchedTarget(combined);
+
+    updateDetectedDisplay(combined);
 
     if (match) {
       if (lastMatchedTarget?.text === match.text) {
@@ -191,10 +195,7 @@ async function scanOnce() {
       }
 
       overlay.classList.add("match");
-      setStatus(
-        `تم رصد «${match.text}» (${consecutiveMatches}/${MATCHES_REQUIRED})…`,
-        "success"
-      );
+      setStatus(`تم رصد «${match.text}» — جاري الفتح…`, "success");
 
       if (consecutiveMatches >= MATCHES_REQUIRED) {
         openTargetLink(match);
@@ -204,18 +205,21 @@ async function scanOnce() {
       lastMatchedTarget = null;
       overlay.classList.remove("match");
       openLinkBtn.classList.add("hidden");
-      setStatus("المسح جارٍ — وجّه الكاميرا نحو النص");
+      setStatus("المسح جارٍ — ضع «رياضيات» داخل الإطار");
     }
   } catch (err) {
     console.error(err);
-    setStatus("خطأ أثناء المسح. جاري المحاولة مرة أخرى…", "error");
+    setStatus("خطأ أثناء المسح. جاري المحاولة…", "error");
   } finally {
     isScanning = false;
+    if (isRunning) {
+      scanTimer = setTimeout(scanOnce, SCAN_INTERVAL_MS);
+    }
   }
 }
 
 function startScanLoop() {
-  scanTimer = setInterval(scanOnce, SCAN_INTERVAL_MS);
+  isRunning = true;
   scanOnce();
 }
 
@@ -226,7 +230,7 @@ async function main() {
     setStatus(`الكاميرا نشطة (${label}) — تحميل OCR…`);
 
     await initOcr();
-    setStatus("المسح جارٍ — وجّه الكاميرا نحو «الرياضيات»");
+    setStatus("المسح جارٍ — ضع «رياضيات» داخل الإطار الأخضر");
     startScanLoop();
   } catch (err) {
     console.error(err);
@@ -236,7 +240,8 @@ async function main() {
 }
 
 window.addEventListener("beforeunload", () => {
-  clearInterval(scanTimer);
+  isRunning = false;
+  clearTimeout(scanTimer);
   video.srcObject?.getTracks().forEach((t) => t.stop());
   worker?.terminate();
 });

@@ -97,7 +97,35 @@ body {
   width: 100%;
   height: 100%;
   object-fit: cover;
+}
+
+/* Front/selfie camera only — rear camera stays natural (not mirrored) */
+#video.mirror {
   transform: scaleX(-1);
+}
+
+.scan-guide {
+  position: absolute;
+  top: 14%;
+  left: 14%;
+  width: 72%;
+  height: 72%;
+  border: 2px dashed rgba(61, 214, 140, 0.85);
+  border-radius: 8px;
+  pointer-events: none;
+  z-index: 1;
+  box-shadow: 0 0 0 9999px rgba(15, 20, 25, 0.25);
+}
+
+.scan-guide::after {
+  content: "ضع الكلمة هنا";
+  position: absolute;
+  bottom: -1.6rem;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 0.75rem;
+  color: rgba(61, 214, 140, 0.95);
+  white-space: nowrap;
 }
 
 .overlay {
