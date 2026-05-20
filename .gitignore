@@ -10,3 +10,6 @@ Desktop.ini
 # Temporary files
 *.tmp
 *.log
+
+# Dependencies
+node_modules/
