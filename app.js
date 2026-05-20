@@ -415,62 +415,87 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    function activateCameraStream() {
+        const width = videoFeed.videoWidth;
+        const height = videoFeed.videoHeight;
+        if (!width || !height) return;
+        if (isCameraStreaming) return;
+
+        canvasOverlay.width = width;
+        canvasOverlay.height = height;
+
+        cameraResolution.textContent = `${width} x ${height} px`;
+        logConsole(`Camera stream initialized at ${width}x${height}px.`, "success");
+
+        isCameraStreaming = true;
+        isFrameFrozen = false;
+
+        hudLayer.style.display = "block";
+        const viewport = document.querySelector(".camera-viewport-container");
+        if (viewport) viewport.classList.add("scanning");
+        btnFreeze.disabled = false;
+        btnFreeze.innerHTML = `<i class="fa-solid fa-pause"></i> Freeze Frame`;
+        if (btnCamera.classList.contains("btn-icon-hud")) {
+            btnCamera.innerHTML = `<i class="fa-solid fa-square"></i>`;
+            btnCamera.className = "btn-icon-hud btn-camera-toggle btn-hud-power active";
+        } else {
+            btnCamera.innerHTML = `<i class="fa-solid fa-square"></i> Stop Scanner`;
+            btnCamera.className = "btn btn-secondary btn-camera-toggle";
+        }
+
+        cameraPlaceholder.style.display = "none";
+        startTemplateCycling();
+        startOCRScanner();
+        startProcessingLoop();
+    }
+
     async function startCamera() {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            logConsole("Camera API not available. Use HTTPS and a supported browser.", "error");
+            alert("Camera is not available. Open this page over HTTPS (required on iPhone).");
+            return;
+        }
+
         const deviceId = cameraSelect.value;
-        const constraints = {
-            video: deviceId ? { deviceId: { exact: deviceId } } : { facingMode: "environment" },
-            audio: false
-        };
-        
+        const videoConstraints = deviceId
+            ? { deviceId: { ideal: deviceId } }
+            : { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } };
+        const constraints = { video: videoConstraints, audio: false };
+
         logConsole("Requesting camera hardware access...");
         hudStatusText.textContent = "SYSTEM STANDBY";
-        
+
         try {
-            localStream = await navigator.mediaDevices.getUserMedia(constraints);
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia(constraints);
+            } catch (primaryErr) {
+                if (!deviceId) throw primaryErr;
+                logConsole("Selected camera failed, using default: " + primaryErr.message, "warning");
+                localStream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: { ideal: "environment" } },
+                    audio: false
+                });
+            }
+
+            videoFeed.setAttribute("playsinline", "");
+            videoFeed.setAttribute("webkit-playsinline", "");
+            videoFeed.playsInline = true;
+            videoFeed.muted = true;
             videoFeed.srcObject = localStream;
+
+            videoFeed.onloadedmetadata = () => activateCameraStream();
+
+            try {
+                await videoFeed.play();
+            } catch (playErr) {
+                logConsole("Video play() failed: " + playErr.message, "error");
+            }
+
             videoFeed.style.opacity = 1;
-            
-            // Wait for video metadata to load so we know dimensions
-            videoFeed.onloadedmetadata = () => {
-                const width = videoFeed.videoWidth;
-                const height = videoFeed.videoHeight;
-                videoFeed.width = width;
-                videoFeed.height = height;
-                
-                canvasOverlay.width = width;
-                canvasOverlay.height = height;
-                
-                cameraResolution.textContent = `${width} x ${height} px`;
-                logConsole(`Camera stream initialized at ${width}x${height}px.`, "success");
-                
-                isCameraStreaming = true;
-                isFrameFrozen = false;
-                
-                // Enable HUD
-                hudLayer.style.display = "block";
-                document.querySelector(".camera-viewport-wrapper").classList.add("scanning");
-                btnFreeze.disabled = false;
-                btnFreeze.innerHTML = `<i class="fa-solid fa-pause"></i> Freeze Frame`;
-                if (btnCamera.classList.contains("btn-icon-hud")) {
-                    btnCamera.innerHTML = `<i class="fa-solid fa-square"></i>`;
-                    btnCamera.className = "btn-icon-hud btn-camera-toggle btn-hud-power active";
-                } else {
-                    btnCamera.innerHTML = `<i class="fa-solid fa-square"></i> Stop Scanner`;
-                    btnCamera.className = "btn btn-secondary btn-camera-toggle";
-                }
-                
-                // Hide standby layout
-                cameraPlaceholder.style.display = "none";
-                
-                // Start template cycling search
-                startTemplateCycling();
-                
-                // Start OCR scanner thread
-                startOCRScanner();
-                
-                // Start processing loop (CV + QR)
-                startProcessingLoop();
-            };
+
+            if (videoFeed.readyState >= HTMLMediaElement.HAVE_METADATA) {
+                activateCameraStream();
+            }
         } catch (err) {
             logConsole("Camera access denied or failed: " + err.message, "error");
             alert("Unable to open camera. Please grant camera permissions and ensure no other application is using it.");
@@ -497,7 +522,8 @@ document.addEventListener("DOMContentLoaded", () => {
         
         // Reset controls
         hudLayer.style.display = "none";
-        document.querySelector(".camera-viewport-wrapper").classList.remove("scanning");
+        const viewport = document.querySelector(".camera-viewport-container");
+        if (viewport) viewport.classList.remove("scanning");
         btnFreeze.disabled = true;
         btnFreeze.innerHTML = `<i class="fa-solid fa-pause"></i> Freeze Frame`;
         
@@ -534,6 +560,9 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    function toggleFreezeFrame() {
+        if (!isCameraStreaming) return;
+
         if (isFrameFrozen) {
             videoFeed.play();
             isFrameFrozen = false;
@@ -551,6 +580,7 @@ document.addEventListener("DOMContentLoaded", () => {
             stopTemplateCycling();
             stopOCRScanner();
         }
+    }
 
     function startTemplateCycling() {
         stopTemplateCycling();
@@ -1938,7 +1968,7 @@ document.addEventListener("DOMContentLoaded", () => {
     function onViewportResize() {
         if (!camera || !renderer) return;
         
-        const container = chkOverlayAR.checked ? document.querySelector(".camera-viewport-wrapper") : rendererContainer;
+        const container = chkOverlayAR.checked ? document.querySelector(".camera-viewport-container") : rendererContainer;
         const w = container.clientWidth;
         const h = container.clientHeight;
         
@@ -1963,7 +1993,7 @@ document.addEventListener("DOMContentLoaded", () => {
             threeCanvas.style.zIndex = "4";
             threeCanvas.style.pointerEvents = "none"; // Let mouse clicks fall through to video card
             
-            document.querySelector(".camera-viewport-wrapper").appendChild(threeCanvas);
+            document.querySelector(".camera-viewport-container").appendChild(threeCanvas);
             
             // Set 3D model hidden initially until a match occurs
             modelGroup.visible = false;

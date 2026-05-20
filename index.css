@@ -436,7 +436,8 @@ body {
     z-index: 5;
 }
 
-.camera-viewport-wrapper.scanning .hud-laser {
+.camera-viewport-wrapper.scanning .hud-laser,
+.camera-viewport-container.scanning .hud-laser {
     animation: scan-vertical 3s linear infinite;
     opacity: 1;
 }
